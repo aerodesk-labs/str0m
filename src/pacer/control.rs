@@ -27,26 +27,19 @@ impl PacerControl {
 
     pub fn calculate(
         &self,
+        current_bitrate: Option<Bitrate>,
         has_active_media: bool,
         estimate: Bitrate,
         is_overuse: bool,
     ) -> PacingResult {
-        // ALR periodic probes handle bandwidth discovery, not continuous padding.
-        let padding_rate = if is_overuse {
-            // No padding during overuse
+        let padding_enabled = current_bitrate.map_or(has_active_media, |v| !v.is_zero());
+        let padding_rate = if is_overuse || !padding_enabled {
             Bitrate::ZERO
-        } else if has_active_media {
-            // Pad to 50 kbps to maintain NAT bindings and RTX state
-            PADDING_TARGET
         } else {
-            // No padding when no media is being sent
-            Bitrate::ZERO
+            PADDING_TARGET.min(estimate)
         };
 
-        // Set pacing rate to smooth out media transmission (burst avoidance).
-        // Must be at least the current BWE estimate * factor, but also high enough
-        // to allow the padding we want to send.
-        let min_pacing_rate = estimate * PACING_FACTOR;
+        let min_pacing_rate = current_bitrate.unwrap_or(estimate).max(estimate) * PACING_FACTOR;
         let pacing_rate = min_pacing_rate.max(padding_rate);
 
         PacingResult {
@@ -63,9 +56,8 @@ mod test {
     #[test]
     fn padding_enabled_with_active_media() {
         let c = PacerControl::new();
-        let estimate = Bitrate::kbps(1_000);
 
-        let r = c.calculate(true, estimate, false);
+        let r = c.calculate(None, true, Bitrate::kbps(1_000), false);
 
         assert_eq!(r.padding_rate, PADDING_TARGET);
     }
@@ -73,9 +65,8 @@ mod test {
     #[test]
     fn no_padding_without_active_media() {
         let c = PacerControl::new();
-        let estimate = Bitrate::kbps(1_000);
 
-        let r = c.calculate(false, estimate, false);
+        let r = c.calculate(None, false, Bitrate::kbps(1_000), false);
 
         assert_eq!(r.padding_rate, Bitrate::ZERO);
     }
@@ -83,9 +74,37 @@ mod test {
     #[test]
     fn overuse_suppresses_padding() {
         let c = PacerControl::new();
-        let estimate = Bitrate::mbps(40);
 
-        let r = c.calculate(true, estimate, true);
+        let r = c.calculate(Some(Bitrate::kbps(500)), true, Bitrate::mbps(40), true);
+
+        assert_eq!(r.padding_rate, Bitrate::ZERO);
+    }
+
+    #[test]
+    fn current_bitrate_acts_as_pacing_floor() {
+        let c = PacerControl::new();
+
+        let r = c.calculate(Some(Bitrate::kbps(2_000)), true, Bitrate::kbps(500), false);
+
+        assert_eq!(r.pacing_rate, Bitrate::kbps(2_000) * PACING_FACTOR);
+    }
+
+    #[test]
+    fn estimate_caps_padding() {
+        let c = PacerControl::new();
+        let estimate = Bitrate::kbps(20);
+
+        let r = c.calculate(Some(Bitrate::kbps(500)), true, estimate, false);
+
+        assert_eq!(r.padding_rate, estimate);
+    }
+
+    #[test]
+    fn explicit_zero_allocation_disables_padding() {
+        let c = PacerControl::new();
+
+        let r = c.calculate(Some(Bitrate::ZERO), true, Bitrate::kbps(1_000), false);
+
         assert_eq!(r.padding_rate, Bitrate::ZERO);
     }
 }
