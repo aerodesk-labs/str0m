@@ -856,7 +856,11 @@ impl StreamTx {
                 // is a headroom since we can accept slightly larger padding than asked for.
                 let max_size = (self.padding * 2).min(self.mtu_warn - MAX_RTP_OVERHEAD);
 
-                let Some(pkt) = self.rtx_cache.get_cached_packet_smaller_than(max_size) else {
+                let Some(pkt) = self
+                    .rtx_cache
+                    .get_cached_packet_smaller_than(max_size)
+                    .filter(|pkt| pkt.payload.len() >= MAX_BLANK_PADDING_PAYLOAD_SIZE as usize)
+                else {
                     // Couldn't find spurious packet, try a blank packet instead.
                     break 'outer;
                 };
