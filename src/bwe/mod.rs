@@ -231,7 +231,13 @@ impl SendSideBandwidthEstimator {
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
 
         // Use the latest probe result from this update, if any
-        let probe_result = latest_probe_result;
+        let probe_result = latest_probe_result.map(|bitrate| {
+            limit_probe_bitrate(
+                bitrate,
+                acked_bitrate,
+                self.delay_controller.last_estimate(),
+            )
+        });
 
         let is_probe_result = probe_result.is_some();
 
@@ -455,6 +461,21 @@ fn in_startup_phase(started_at: Option<Instant>, now: Instant) -> bool {
     started_at
         .map(|s| now.duration_since(s) <= STARTUP_PHASE)
         .unwrap_or(false)
+}
+
+fn limit_probe_bitrate(
+    probe_bitrate: Bitrate,
+    acknowledged_bitrate: Option<Bitrate>,
+    delay_estimate: Option<Bitrate>,
+) -> Bitrate {
+    let Some(acknowledged_bitrate) = acknowledged_bitrate else {
+        return probe_bitrate;
+    };
+    let Some(delay_estimate) = delay_estimate else {
+        return probe_bitrate;
+    };
+
+    probe_bitrate.max(delay_estimate.min(acknowledged_bitrate * 0.85))
 }
 
 impl TryFrom<&TwccSendRecord> for AckedPacket {
