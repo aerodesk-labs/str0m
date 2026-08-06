@@ -40,7 +40,11 @@ impl DtlsProvider for AwsLcRsDtlsProvider {
 
         // Create a default dimpl Config with AWS-LC-RS crypto provider
         // ICE verifies return routability before DTLS, making server cookies redundant.
-        let mut builder = dimpl::Config::builder().use_server_cookie(false);
+        // #85: raise DTLS receive queue so data-channel bursts (file transfer)
+        // don't overflow the default 30-record queue and disconnect peers.
+        let mut builder = dimpl::Config::builder()
+            .use_server_cookie(false)
+            .max_queue_rx(2048);
         if let Some(mtu) = mtu {
             builder = builder.mtu(mtu);
         }
