@@ -40,7 +40,12 @@ impl DtlsProvider for RustCryptoDtlsProvider {
 
         // Create a default dimpl Config with RustCrypto crypto provider
         // ICE verifies return routability before DTLS, making server cookies redundant.
-        let mut builder = dimpl::Config::builder().use_server_cookie(false);
+        // #85: 远端桌面 data channel 大文件传输下，对端（SFU/客户端）可能一次
+        // 到达 >30 条 DTLS 记录；默认 receive queue (30) 会溢出断连。
+        // 提升到 2048 吸收突发（约 3MB 上限，桌面端可接受）。
+        let mut builder = dimpl::Config::builder()
+            .use_server_cookie(false)
+            .max_queue_rx(2048);
         if let Some(mtu) = mtu {
             builder = builder.mtu(mtu);
         }
