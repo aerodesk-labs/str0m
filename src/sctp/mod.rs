@@ -27,7 +27,7 @@ mod error;
 pub use error::SctpError;
 
 /// Bytes that can be buffered inside str0m across all streams.
-const MAX_BUFFERED_ACROSS_STREAMS: usize = 128 * 1024;
+const MAX_BUFFERED_ACROSS_STREAMS: usize = 8 * 1024 * 1024;
 
 /// Maximum message size we advertise in SDP (what we can receive)
 pub const LOCAL_MAX_MESSAGE_SIZE: u32 = 256 * 1024;
