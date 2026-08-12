@@ -1445,8 +1445,12 @@ impl IceAgent {
         // for traffic that isn't actually directed at one of our interfaces.
         let local_idx = match self.local_candidates.iter().position(|v| {
             matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
-                && v.addr() == req.destination
                 && v.proto() == req.proto
+                && (v.addr() == req.destination
+                    // 通配绑定（0.0.0.0）的 socket 收包 destination 是 0.0.0.0:port，
+                    // 与登记的通告候选（公网 IP:port）不同；按端口匹配即可（#216 外部
+                    // TURN/媒体服务器场景，SFU_BIND_ADDRESS=0.0.0.0 + SFU_HOST_ADDRESS=公网IP）。
+                    || (req.destination.ip().is_unspecified() && v.addr().port() == req.destination.port()))
         }) {
             Some(i) => i,
             None => {
