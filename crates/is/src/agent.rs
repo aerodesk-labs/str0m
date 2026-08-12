@@ -1454,15 +1454,24 @@ impl IceAgent {
         }) {
             Some(i) => i,
             None => {
-                // Receiving traffic for an IP address that neither is a HOST nor RELAY
-                // is most likely a configuration fault where the user forgot to add a
-                // candidate for the local interface. We are network-connected application
-                // so we need to handle this gracefully: Log a message and discard the packet.
-                debug!(
-                    "Discarding STUN request on unknown interface: {}",
-                    Pii(req.destination)
-                );
-                return;
+                // 通配/多宿主 socket 或 relayed 收包场景：destination 与本地候选地址
+                // 不可能相同（relayed 候选地址在 TURN 服务器上）。请求已通过 username
+                // 校验且来源为已知远端候选（或建 peer-reflexive），回退到第一个可用
+                // Host/Relayed 候选即可安全成对（#216 外部 TURN force-relay 客户端）。
+                match self.local_candidates.iter().position(|v| {
+                    matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
+                        && v.proto() == req.proto
+                        && !v.discarded()
+                }) {
+                    Some(i) => i,
+                    None => {
+                        debug!(
+                            "Discarding STUN request on unknown interface: {}",
+                            Pii(req.destination)
+                        );
+                        return;
+                    }
+                }
             }
         };
 
