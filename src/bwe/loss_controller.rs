@@ -87,9 +87,6 @@ pub struct LossController {
 
     /// Link capacity estimate from probes during ALR
     link_capacity_estimate: Option<Bitrate>,
-
-    /// Previous ALR state to detect transitions
-    was_in_alr: bool,
 }
 
 /// State of the Loss Controller
@@ -145,7 +142,6 @@ impl LossController {
 
             alr_start_time: None,
             link_capacity_estimate: None,
-            was_in_alr: false,
 
             config,
         };
@@ -177,24 +173,8 @@ impl LossController {
         self.acknowledged_bitrate = acknowledged_bitrate;
     }
 
-    /// Set ALR start time from the ALR detector.
     pub fn set_alr_start_time(&mut self, alr_start: Option<Instant>) {
-        let was_in_alr = self.was_in_alr;
-        let is_in_alr = alr_start.is_some();
-
-        // Detect ALR state transition
-        if was_in_alr != is_in_alr {
-            // Reset observations on ALR transition to avoid mixing
-            // ALR and non-ALR traffic in the same observation window
-            self.reset_observations();
-            trace!(
-                "LossController: ALR state changed (was: {}, now: {}), observations reset",
-                was_in_alr, is_in_alr
-            );
-        }
-
         self.alr_start_time = alr_start;
-        self.was_in_alr = is_in_alr;
     }
 
     /// Set link capacity estimate from successful ALR probes.
@@ -205,23 +185,6 @@ impl LossController {
     /// Check if currently in ALR state
     fn is_in_alr(&self) -> bool {
         self.alr_start_time.is_some()
-    }
-
-    /// Reset all observations.
-    ///
-    /// Called when ALR state transitions to avoid mixing traffic patterns
-    /// from different network utilization regimes.
-    fn reset_observations(&mut self) {
-        self.partial_observation = PartialObservation::new();
-        self.last_send_time_most_recent_observation = Timestamp::DistantFuture;
-
-        // Clear observation window
-        for observation in self.observations.iter_mut() {
-            *observation = Observation::DUMMY;
-        }
-
-        // Reset cached values that depend on observations
-        self.cached_instant_upper_bound = None;
     }
 
     /// Update the estimate using TWCC feedback from the network.
@@ -1066,7 +1029,12 @@ impl Default for Config {
             newton_step_size: 0.75,
             not_increase_if_inherent_loss_less_than_average_loss: true,
             delayed_increase_window: Duration::from_millis(300),
-            bandwidth_rampup_upper_bound_factor: 1.5,
+            // WebRTC `BwRampupUpperBoundFactor`, default 1000000.0. The bound is nominally
+            // `acknowledged_bitrate * factor`, but the default is large enough that it never
+            // binds. Capping at 1.5x acked stalls recovery whenever the application is sending
+            // far below capacity (e.g. static screen share), because the only way back up is a
+            // probe and the acked rate is then just the padding rate.
+            bandwidth_rampup_upper_bound_factor: 1_000_000.0,
             candidate_factor: [1.02, 1.0, 0.95],
             append_acknowledged_rate_candidate: true,
             append_delay_based_estimate_candidate: true,
@@ -1078,7 +1046,13 @@ impl Default for Config {
             threshold_of_high_bandwidth_preference: 0.2,
             bandwidth_preference_smoothing_factor: 0.002,
             use_byte_loss_ratio: true,
-            hold_duration_factor: 2.0,
+            // WebRTC `HoldDurationFactor`, default 0.0, which disables the HOLD mechanism
+            // entirely: `last_hold_info.duration` stays zero, so the hold check in
+            // `update_bandwidth_estimate` never fires. With a non-zero factor the hold doubles
+            // on every entry into `Decreasing` (up to 60s) and its early return skips the state
+            // transition, so the controller cannot leave `Decreasing` and probe results are
+            // truncated to the held rate.
+            hold_duration_factor: 0.0,
             bandwidth_rampup_hold_threshold: 1.3,
             bandwidth_rampup_upper_bound_factor_in_hold: 1.2,
         }

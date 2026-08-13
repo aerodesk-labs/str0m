@@ -1445,20 +1445,33 @@ impl IceAgent {
         // for traffic that isn't actually directed at one of our interfaces.
         let local_idx = match self.local_candidates.iter().position(|v| {
             matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
-                && v.addr() == req.destination
                 && v.proto() == req.proto
+                && (v.addr() == req.destination
+                    // 通配绑定（0.0.0.0）的 socket 收包 destination 是 0.0.0.0:port，
+                    // 与登记的通告候选（公网 IP:port）不同；按端口匹配即可（#216 外部
+                    // TURN/媒体服务器场景，SFU_BIND_ADDRESS=0.0.0.0 + SFU_HOST_ADDRESS=公网IP）。
+                    || (req.destination.ip().is_unspecified() && v.addr().port() == req.destination.port()))
         }) {
             Some(i) => i,
             None => {
-                // Receiving traffic for an IP address that neither is a HOST nor RELAY
-                // is most likely a configuration fault where the user forgot to add a
-                // candidate for the local interface. We are network-connected application
-                // so we need to handle this gracefully: Log a message and discard the packet.
-                debug!(
-                    "Discarding STUN request on unknown interface: {}",
-                    Pii(req.destination)
-                );
-                return;
+                // 通配/多宿主 socket 或 relayed 收包场景：destination 与本地候选地址
+                // 不可能相同（relayed 候选地址在 TURN 服务器上）。请求已通过 username
+                // 校验且来源为已知远端候选（或建 peer-reflexive），回退到第一个可用
+                // Host/Relayed 候选即可安全成对（#216 外部 TURN force-relay 客户端）。
+                match self.local_candidates.iter().position(|v| {
+                    matches!(v.kind(), CandidateKind::Host | CandidateKind::Relayed)
+                        && v.proto() == req.proto
+                        && !v.discarded()
+                }) {
+                    Some(i) => i,
+                    None => {
+                        debug!(
+                            "Discarding STUN request on unknown interface: {}",
+                            Pii(req.destination)
+                        );
+                        return;
+                    }
+                }
             }
         };
 

@@ -119,6 +119,11 @@ impl ProbeClusterConfig {
         self.min_probe_delta
     }
 
+    /// Get the intended duration of the probe burst.
+    pub fn target_duration(&self) -> Duration {
+        self.target_duration
+    }
+
     /// Calculate the target bytes for this probe.
     /// This is how much data we expect to send at target_bitrate for target_duration.
     pub fn target_bytes(&self) -> DataSize {

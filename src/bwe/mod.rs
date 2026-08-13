@@ -55,6 +55,7 @@ const STARTUP_PHASE: Duration = Duration::from_secs(2);
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
+    current_bitrate: Bitrate,
     desired_bitrate: Bitrate,
     smoother: EstimateSmoother,
 }
@@ -64,6 +65,7 @@ impl Bwe {
         let send_side_bwe = SendSideBandwidthEstimator::new(initial);
         Bwe {
             bwe: send_side_bwe,
+            current_bitrate: Bitrate::ZERO,
             desired_bitrate: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
         }
@@ -109,19 +111,24 @@ impl Bwe {
         self.bwe.last_estimate()
     }
 
-    pub fn on_media_sent(&mut self, payload_size: DataSize, is_padding: bool, now: Instant) {
-        if !is_padding {
-            // Update ALR detector with media bytes sent
-            self.bwe.on_media_sent(payload_size, now);
-        }
-    }
-
-    pub fn is_overusing(&self) -> bool {
-        self.bwe.is_overusing()
+    pub fn on_packet_sent(&mut self, payload_size: DataSize, now: Instant) {
+        self.bwe.on_packet_sent(payload_size, now);
     }
 
     pub fn set_desired_bitrate(&mut self, v: Bitrate) {
         self.desired_bitrate = v;
+    }
+
+    pub fn set_current_bitrate(&mut self, v: Bitrate) {
+        self.current_bitrate = v;
+    }
+
+    pub fn current_bitrate(&self) -> Bitrate {
+        self.current_bitrate
+    }
+
+    pub fn is_overusing(&self) -> bool {
+        self.bwe.is_overusing()
     }
 }
 
@@ -161,20 +168,17 @@ impl SendSideBandwidthEstimator {
         }
     }
 
-    /// Whether the delay-based detector currently signals overuse.
-    ///
-    /// This is useful for gating behaviors (like padding/probing) that would otherwise
-    /// re-excite the system while we're already congested.
-    pub fn is_overusing(&self) -> bool {
-        self.delay_controller.is_overusing()
+    pub fn on_packet_sent(&mut self, bytes: DataSize, now: Instant) {
+        debug_assert!(bytes > DataSize::ZERO);
+        self.alr_detector.on_bytes_sent(bytes, now);
     }
 
-    /// Update ALR detector with actual bytes sent.
+    /// Whether the delay-based detector currently signals overuse.
     ///
-    /// Should be called for media packets (not padding/probes).
-    /// This is typically called from the session's packet sending logic.
-    pub fn on_media_sent(&mut self, bytes: DataSize, now: Instant) {
-        self.alr_detector.on_bytes_sent(bytes, now);
+    /// Used to gate padding, mirroring the `congested_` check in libWebRTC's
+    /// `PacingController::PaddingToAdd()`.
+    pub fn is_overusing(&self) -> bool {
+        self.delay_controller.is_overusing()
     }
 
     /// Record a packet from a TWCC report.
@@ -221,7 +225,13 @@ impl SendSideBandwidthEstimator {
         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
 
         // Use the latest probe result from this update, if any
-        let probe_result = latest_probe_result;
+        let probe_result = latest_probe_result.map(|bitrate| {
+            limit_probe_bitrate(
+                bitrate,
+                acked_bitrate,
+                self.delay_controller.last_estimate(),
+            )
+        });
 
         let is_probe_result = probe_result.is_some();
 
@@ -340,6 +350,13 @@ impl SendSideBandwidthEstimator {
 
         let cause = self.bandwidth_limited_cause();
 
+        tracing::trace!(
+            estimate_bps = estimate.as_f64() as u64,
+            ?cause,
+            in_alr = self.alr_detector.alr_start_time().is_some(),
+            "BWE estimate updated"
+        );
+
         self.probe_control.set_estimated_bitrate(estimate, cause);
         self.alr_detector.set_estimated_bitrate(estimate);
 
@@ -447,6 +464,26 @@ fn in_startup_phase(started_at: Option<Instant>, now: Instant) -> bool {
         .unwrap_or(false)
 }
 
+fn limit_probe_bitrate(
+    probe_bitrate: Bitrate,
+    acknowledged_bitrate: Option<Bitrate>,
+    delay_estimate: Option<Bitrate>,
+) -> Bitrate {
+    debug_assert!(probe_bitrate.is_valid());
+    debug_assert!(acknowledged_bitrate.is_none_or(|bitrate| bitrate.is_valid()));
+    debug_assert!(delay_estimate.is_none_or(|bitrate| bitrate.is_valid()));
+
+    let Some(acknowledged_bitrate) = acknowledged_bitrate else {
+        return probe_bitrate;
+    };
+    let Some(delay_estimate) = delay_estimate else {
+        return probe_bitrate;
+    };
+
+    let lower_bound = delay_estimate.min(acknowledged_bitrate * 0.85);
+    probe_bitrate.max(lower_bound)
+}
+
 impl TryFrom<&TwccSendRecord> for AckedPacket {
     type Error = ();
 
@@ -482,5 +519,58 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn all_sent_packets_count_toward_application_usage() {
+        let mut bwe = Bwe::new(Bitrate::mbps(1));
+        let started_at = Instant::now();
+
+        bwe.on_packet_sent(DataSize::bytes(813), started_at);
+        for tick in 1..=100 {
+            bwe.on_packet_sent(
+                DataSize::bytes(813),
+                started_at + Duration::from_millis(tick * 10),
+            );
+        }
+
+        assert!(bwe.bwe.alr_detector.alr_start_time().is_none());
+    }
+
+    #[test]
+    fn low_probe_result_is_limited_by_acknowledged_throughput() {
+        assert_eq!(
+            limit_probe_bitrate(
+                Bitrate::kbps(100),
+                Some(Bitrate::mbps(1)),
+                Some(Bitrate::mbps(2))
+            ),
+            Bitrate::kbps(850)
+        );
+        assert_eq!(
+            limit_probe_bitrate(
+                Bitrate::kbps(100),
+                Some(Bitrate::mbps(2)),
+                Some(Bitrate::kbps(700))
+            ),
+            Bitrate::kbps(700)
+        );
+        assert_eq!(
+            limit_probe_bitrate(
+                Bitrate::mbps(2),
+                Some(Bitrate::mbps(1)),
+                Some(Bitrate::mbps(1))
+            ),
+            Bitrate::mbps(2)
+        );
+        assert_eq!(
+            limit_probe_bitrate(Bitrate::kbps(500), None, Some(Bitrate::mbps(1))),
+            Bitrate::kbps(500)
+        );
     }
 }

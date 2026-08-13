@@ -18,6 +18,19 @@ pub enum BweKind {
 pub struct Bwe<'a>(pub(crate) &'a mut Rtc);
 
 impl<'a> Bwe<'a> {
+    /// Configure the currently allocated media bitrate.
+    ///
+    /// This is the bitrate currently allocated to media, i.e. the sum of the target bitrates
+    /// of the streams actually being sent. It corresponds to libWebRTC's
+    /// `min_total_allocated_bitrate`: it sets the pacing floor and enables padding. Set it to
+    /// zero when no media is allocated, which disables padding.
+    ///
+    /// This is distinct from [`set_desired_bitrate`][Self::set_desired_bitrate], which is what
+    /// the application *would* send given more bandwidth, and which drives probing.
+    pub fn set_current_bitrate(&mut self, current_bitrate: Bitrate) {
+        self.0.session.set_bwe_current_bitrate(current_bitrate);
+    }
+
     /// Configure the desired bitrate.
     ///
     /// Configure the bandwidth estimation system with the desired bitrate.

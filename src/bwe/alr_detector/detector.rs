@@ -70,11 +70,8 @@ impl AlrDetector {
         }
     }
 
-    /// Update with bytes sent.
-    ///
-    /// Should be called for every media packet sent (excluding padding and probes).
-    /// This updates the IntervalBudget and checks for ALR state transitions.
     pub fn on_bytes_sent(&mut self, bytes: DataSize, now: Instant) {
+        debug_assert!(bytes > DataSize::ZERO);
         // First call - just record time
         let Some(last) = self.last_send_time else {
             self.last_send_time = Some(now);

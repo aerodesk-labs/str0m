@@ -24,6 +24,17 @@ const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 /// Matches WebRTC's `kMaxValidRatio`.
 const MAX_VALID_RATIO: f64 = 2.0;
 
+/// How far a probe's actual send window may exceed its intended duration.
+///
+/// A probe cluster asks the pacer to emit `target_bytes` over `target_duration`
+/// (typically 15ms). If the pacer cannot keep up, the same bytes dribble out over
+/// hundreds of milliseconds and the measured send rate collapses - an 800kbps probe
+/// spread over 350ms measures ~34kbps. That is a statement about str0m's ability to
+/// emit padding, not about the link, so feeding it to the estimator is wrong.
+///
+/// Reject any probe whose send window exceeds `target_duration * 4`.
+const MAX_SEND_INTERVAL_STRETCH: u32 = 4;
+
 /// Minimum |receive rate| / |send rate| ratio to consider the link unsaturated.
 /// Matches WebRTC's `kMinRatioForUnsaturatedLink`.
 const MIN_RATIO_FOR_UNSATURATED_LINK: f64 = 0.9;
@@ -291,7 +302,24 @@ impl ProbeEstimatorState {
         };
 
         // Log the estimates continuously during the probe.
-        trace!(%result, "Probe result");
+        trace!(
+            %result,
+            target_bps = self.config.target_bitrate().as_f64() as u64,
+            sent_bytes = self.total_bytes.as_bytes_usize(),
+            target_bytes = self.config.target_bytes().as_bytes_usize(),
+            packets = self.packet_count,
+            send_ms = self
+                .last_send_time
+                .zip(self.first_send_time)
+                .map(|(l, f)| l.saturating_duration_since(f).as_millis())
+                .unwrap_or(0),
+            recv_ms = self
+                .last_recv_time
+                .zip(self.first_recv_time)
+                .map(|(l, f)| l.saturating_duration_since(f).as_millis())
+                .unwrap_or(0),
+            "Probe result"
+        );
         log_probe_bitrate_estimate!(bitrate.as_f64());
 
         Some((self.config, bitrate))
@@ -362,6 +390,19 @@ impl ProbeEstimatorState {
             };
         }
 
+        // Reject if the pacer failed to emit the burst within a reasonable multiple of the
+        // intended duration. Such a probe measures our own padding throughput, not the link.
+        let max_send_interval = self.config.target_duration() * MAX_SEND_INTERVAL_STRETCH;
+        if send_interval > max_send_interval {
+            return ProbeResult::UnderDelivered {
+                interval: send_interval,
+                limit: max_send_interval,
+                bytes: self.total_bytes,
+                target: self.config.target_bytes(),
+                packets: self.packet_count,
+            };
+        }
+
         // WebRTC boundary exclusions:
         // - exclude the last sent packet size when computing send rate
         // - exclude the first received packet size when computing receive rate
@@ -417,6 +458,15 @@ enum ProbeResult {
     SendIntervalInvalid { interval: Duration },
     /// Receive interval invalid (zero or > 1 second)
     RecvIntervalInvalid { interval: Duration },
+    /// The pacer took far longer than `target_duration` to emit the burst, so the
+    /// measured rate reflects our own padding throughput rather than the link.
+    UnderDelivered {
+        interval: Duration,
+        limit: Duration,
+        bytes: DataSize,
+        target: DataSize,
+        packets: usize,
+    },
     /// Invalid receive/send ratio (recv_rate / send_rate too high)
     InvalidSendReceiveRatio { ratio: f64, limit: f64 },
     /// Calculated data size is zero
@@ -455,6 +505,19 @@ impl fmt::Display for ProbeResult {
             }
             ProbeResult::RecvIntervalInvalid { interval } => {
                 write!(f, "recv interval invalid ({:?})", interval)
+            }
+            ProbeResult::UnderDelivered {
+                interval,
+                limit,
+                bytes,
+                target,
+                packets,
+            } => {
+                write!(
+                    f,
+                    "under-delivered: burst took {:?} (limit {:?}), sent {} of {} in {} packets",
+                    interval, limit, bytes, target, packets
+                )
             }
             ProbeResult::InvalidSendReceiveRatio { ratio, limit } => {
                 write!(f, "invalid receive/send ratio ({ratio:.3} > {limit:.3})")

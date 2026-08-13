@@ -10,6 +10,8 @@ use super::{ProbeClusterConfig, ProbeKind};
 use crate::rtp_::{Bitrate, TwccClusterId};
 use crate::util::{already_happened, not_happening};
 
+use tracing::trace;
+
 // Port notes:
 // This module ports WebRTC's `ProbeController` behavior from:
 // `webrtc/modules/congestion_controller/goog_cc/probe_controller.cc`
@@ -26,6 +28,11 @@ const MAX_WAITING_TIME_FOR_PROBING_RESULT: Duration = Duration::from_secs(1);
 const BITRATE_DROP_THRESHOLD: f64 = 0.66;
 const BITRATE_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FRACTION_AFTER_DROP: f64 = 0.85;
+/// After a LargeDrop probe fires, suppress new LargeDrop triggers for this long.
+/// Without this, a bad probe measurement causes the estimate to drop, which triggers
+/// another LargeDrop, producing an ever-lower probe target — a death spiral.
+/// During the cooldown, PeriodicAlr (every 5s) handles recovery instead.
+const LARGE_DROP_COOLDOWN: Duration = Duration::from_secs(30);
 const PROBE_UNCERTAINTY: f64 = 0.05;
 const ALR_ENDED_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_TIME_BETWEEN_ALR_PROBES: Duration = Duration::from_secs(5);
@@ -72,6 +79,7 @@ pub struct ProbeControl {
     last_probe: Option<LastProbe>,
 
     large_drop: Option<LargeDrop>,
+    last_large_drop_fired_at: Option<Instant>,
 
     last_stagnant: Option<Instant>,
 
@@ -113,6 +121,7 @@ impl Default for ProbeControl {
             next_cluster_id: 0.into(),
             last_probe: None,
             large_drop: None,
+            last_large_drop_fired_at: None,
             last_stagnant: None,
             pending: VecDeque::new(),
             scheduled_exponential: None,
@@ -387,7 +396,7 @@ impl ProbeControl {
             return false;
         }
 
-        // Periodic ALR probe at 2× desired (capped by queue_probe to 2× desired anyway).
+        // Periodic ALR probe at 2× desired, capped by queue_probe to 2× desired anyway.
         // Using desired rather than estimate allows discovering higher capacity when
         // the app wants more bandwidth than currently estimated.
         let target = desired * self.config.further_exponential_probe_scale;
@@ -485,6 +494,17 @@ impl ProbeControl {
             return false;
         }
 
+        // Cooldown: after a LargeDrop probe fires, suppress new triggers for a while.
+        // Without this, each bad probe measurement (e.g. a delayed packet inflating
+        // recv_interval) drops the estimate, triggering a new LargeDrop at an even lower
+        // target — a death spiral toward zero. During the cooldown, PeriodicAlr (every 5s)
+        // handles recovery.
+        if let Some(last_fired) = self.last_large_drop_fired_at {
+            if now.saturating_duration_since(last_fired) < LARGE_DROP_COOLDOWN {
+                return false;
+            }
+        }
+
         // Detect large drops: estimate fell below 66% of previous.
         if self.large_drop.is_none() {
             if let Some(prev) = self.prev_estimate {
@@ -523,6 +543,7 @@ impl ProbeControl {
         self.queue_probe(target, ProbeKind::LargeDrop, desired, now);
 
         self.large_drop = None;
+        self.last_large_drop_fired_at = Some(now);
         true
     }
 
@@ -546,6 +567,13 @@ impl ProbeControl {
         // Threshold for further exponential probing (probe_bitrate * 0.7).
         let probe_further = bitrate * self.config.further_probe_threshold;
 
+        trace!(
+            ?kind,
+            target_bps = bitrate.as_f64() as u64,
+            further_threshold_bps = probe_further.as_f64() as u64,
+            "Probe queued"
+        );
+
         self.pending.push_back(config);
         self.last_probe = Some(LastProbe {
             when: now,
@@ -558,8 +586,18 @@ impl ProbeControl {
     fn compute_next_timeout(&mut self, now: Instant) -> Instant {
         // Exponential probing: wait for probe result before re-probing at same estimate.
         // This handles the case where we sent a probe but haven't received updated estimate yet.
+        // WebRTC starts these with `probe_further = true`, which parks the controller in
+        // `kWaitingForProbingResult`; `SetEstimatedBitrate` then chains the next probe as soon as
+        // a result arrives. Periodic ALR probes are started that way too
+        // (`InitiateProbing(at_time, {...}, /*probe_further=*/true)` in `Process`), so they must
+        // get the same short reschedule. Letting them fall through to the ALR branch below
+        // throttles the exponential chain to one step per `MIN_TIME_BETWEEN_ALR_PROBES`, which is
+        // what makes ramp-up crawl while application limited.
         if let Some(last) = &self.last_probe {
-            if matches!(last.kind, ProbeKind::Initial | ProbeKind::Exponential) {
+            if matches!(
+                last.kind,
+                ProbeKind::Initial | ProbeKind::Exponential | ProbeKind::PeriodicAlr
+            ) {
                 if self.scheduled_exponential.is_none() {
                     self.scheduled_exponential = Some(now + MAX_WAITING_TIME_FOR_PROBING_RESULT);
                 }

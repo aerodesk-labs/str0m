@@ -1,5 +1,6 @@
 #![allow(unused)]
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::ops::{Deref, DerefMut};
@@ -78,6 +79,36 @@ pub struct TestRtc {
     pub events: Vec<(Instant, Event)>,
     pub pending: Netem<PendingPacket>,
     pub forced_time_advance: Duration,
+    /// RTP payload bytes transmitted, keyed by SSRC.
+    ///
+    /// SRTP leaves the RTP header in the clear, so outgoing datagrams can be attributed to a
+    /// stream without decrypting. Lets tests distinguish media from RTX (padding and resends).
+    pub sent_bytes_by_ssrc: HashMap<u32, u64>,
+}
+
+/// Read the SSRC from an outgoing RTP datagram, if it looks like one.
+///
+/// Returns `None` for STUN, DTLS and RTCP so those do not pollute the counts.
+fn rtp_ssrc(contents: &[u8]) -> Option<u32> {
+    // Shortest RTP packet is a 12 byte header.
+    if contents.len() < 12 {
+        return None;
+    }
+    // Version must be 2.
+    if contents[0] >> 6 != 2 {
+        return None;
+    }
+    // Demux by payload type: RTCP occupies 64-95 once the marker bit is masked off.
+    let pt = contents[1] & 0x7f;
+    if (64..96).contains(&pt) {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        contents[8],
+        contents[9],
+        contents[10],
+        contents[11],
+    ]))
 }
 
 impl TestRtc {
@@ -114,6 +145,7 @@ impl TestRtc {
             start: now,
             last: now,
             events: vec![],
+            sent_bytes_by_ssrc: HashMap::new(),
             pending: Netem::new(NetemConfig::new()),
             forced_time_advance: Duration::from_millis(10),
         }
@@ -363,6 +395,9 @@ fn rtc_poll_to_timeout(
                         v.source,
                         v.destination,
                     );
+                }
+                if let Some(ssrc) = rtp_ssrc(&v.contents) {
+                    *rtc.sent_bytes_by_ssrc.entry(ssrc).or_default() += v.contents.len() as u64;
                 }
                 let packet = PendingPacket {
                     proto: v.proto,

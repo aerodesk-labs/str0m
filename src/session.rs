@@ -951,9 +951,8 @@ impl Session {
                 .register_seq(packet_id, now, payload_size);
         }
 
-        // Update BWE subsystem
         if let Some(bwe) = self.bwe.as_mut() {
-            bwe.on_media_sent(payload_size.into(), is_padding, now);
+            bwe.on_packet_sent(payload_size.into(), now);
         }
 
         if !is_padding && !header.ssrc.is_probe() {
@@ -1063,6 +1062,13 @@ impl Session {
         }
     }
 
+    pub fn set_bwe_current_bitrate(&mut self, current_bitrate: Bitrate) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.set_current_bitrate(current_bitrate);
+            self.configure_pacer();
+        }
+    }
+
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);
@@ -1093,26 +1099,17 @@ impl Session {
         };
 
         let Some(current_estimate) = bwe.last_estimate() else {
-            // No estimate yet, no padding
             return;
         };
+        let current_bitrate = bwe.current_bitrate();
         let is_overuse = bwe.is_overusing();
 
-        let has_active_media = self.has_active_outgoing_media();
-
-        // Calculate pacing and padding rates
         let result = self
             .pacer_control
-            .calculate(has_active_media, current_estimate, is_overuse);
+            .calculate(current_bitrate, current_estimate, is_overuse);
 
         self.pacer.set_padding_rate(result.padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);
-    }
-
-    fn has_active_outgoing_media(&self) -> bool {
-        self.medias
-            .iter()
-            .any(|m| m.direction().is_sending() && !m.disabled())
     }
 
     pub fn media_by_mid(&self, mid: Mid) -> Option<&Media> {

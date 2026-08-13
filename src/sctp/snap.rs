@@ -18,7 +18,10 @@ pub(super) fn webrtc_transport_config() -> Arc<TransportConfig> {
         TransportConfig::default()
             .with_max_init_retransmits(None)
             .with_max_data_retransmits(None)
-            .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE),
+            .with_max_receive_message_size(LOCAL_MAX_MESSAGE_SIZE)
+            // #85：提升接收窗口信用到 8MB——默认 1MB 限制单 SACK 周期在途字节，
+            // 是 data channel 大文件吞吐的瓶颈（128KB 发送缓冲 + 1MB rwnd）。
+            .with_max_receive_buffer_size(8 * 1024 * 1024),
     )
 }
 
