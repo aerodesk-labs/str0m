@@ -176,6 +176,9 @@ pub(crate) struct ChannelHandler {
     /// Stream IDs recently closed, with the time they were closed.
     /// Excluded from allocation until the cooldown expires.
     closed_stream_ids: Vec<(u16, Instant)>,
+    /// #460：DCEP 未完成（channel 尚未注册 stream_id）时收到的数据暂存，
+    /// channel 注册后重放，避免 offer/answer 信令被丢弃。
+    pending_data: Vec<(u16, bool, Vec<u8>)>,
 }
 
 #[derive(Debug)]
@@ -334,6 +337,21 @@ impl ChannelHandler {
         } else {
             None
         }
+    }
+
+    /// #460：暂存 channel 未注册时到达的数据。
+    pub fn push_pending_data(&mut self, stream_id: u16, binary: bool, data: Vec<u8>) {
+        self.pending_data.push((stream_id, binary, data));
+    }
+
+    /// #460：取出第一个 channel 已注册的暂存数据（重放用）。
+    pub fn take_ready_pending_data(&mut self) -> Option<(ChannelId, bool, Vec<u8>)> {
+        let pos = self.pending_data.iter().position(|(s, _, _)| {
+            self.allocations.iter().any(|a| a.sctp_stream_id == Some(*s))
+        })?;
+        let (stream_id, binary, data) = self.pending_data.remove(pos);
+        let id = self.channel_id_by_stream_id(stream_id)?;
+        Some((id, binary, data))
     }
 
     pub fn ensure_channel_id_for(&mut self, sctp_stream_id: u16) {
