@@ -1700,11 +1700,6 @@ impl Rtc {
             return Ok(Output::Event(Event::Connected));
         }
 
-        // #460：DCEP 完成前暂存的 channel data，channel 注册后重放。
-        if let Some((id, binary, data)) = self.chan.take_ready_pending_data() {
-            return Ok(Output::Event(Event::ChannelData(ChannelData { id, binary, data })));
-        }
-
         while let Some(e) = self.sctp.poll() {
             match e {
                 SctpEvent::Transmit { mut packets } => {
@@ -1757,14 +1752,11 @@ impl Rtc {
                     return Ok(Output::Event(Event::Closed));
                 }
                 SctpEvent::Data { id, binary, data } => {
-                    let Some(cid) = self.chan.channel_id_by_stream_id(id) else {
-                        // #460：DCEP 未完成，channel 尚未注册 stream_id，暂存待重放，
-                        // 否则 offer/answer 等早期数据会被丢弃导致重协商卡死。
-                        debug!("Buffer ChannelData for stream {id} until channel open");
-                        self.chan.push_pending_data(id, binary, data);
+                    let Some(id) = self.chan.channel_id_by_stream_id(id) else {
+                        warn!("Drop ChannelData event for id: {:?}", id);
                         continue;
                     };
-                    let cd = ChannelData { id: cid, binary, data };
+                    let cd = ChannelData { id, binary, data };
                     return Ok(Output::Event(Event::ChannelData(cd)));
                 }
                 SctpEvent::BufferedAmountLow { id } => {
