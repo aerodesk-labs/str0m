@@ -29,8 +29,11 @@ pub use error::SctpError;
 /// Bytes that can be buffered inside str0m across all streams.
 const MAX_BUFFERED_ACROSS_STREAMS: usize = 8 * 1024 * 1024;
 
-/// Maximum message size we advertise in SDP (what we can receive)
-pub const LOCAL_MAX_MESSAGE_SIZE: u32 = 256 * 1024;
+/// Maximum message size we advertise in SDP (what we can receive).
+/// 1 MiB so application data-channel payloads up to 1 MiB (e.g. remote command
+/// list-processes responses) are not silently dropped; aligned with aerodesk's
+/// `MAX_OUTPUT_BYTES` (1 MiB).
+pub const LOCAL_MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 
 /// Default max message size if remote doesn't advertise
 pub const DEFAULT_REMOTE_MAX_MESSAGE_SIZE: u32 = 64 * 1024;
